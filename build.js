@@ -1,5 +1,5 @@
 // build.js — turns NHTSA's giant recall file into tidy files for the app
-// LESSON 8, STEP 7a VERSION: adds sanity checks before publishing
+// LESSON 8, STEP 7b VERSION: adds the referee (compare against NHTSA's live API)
 
 const fs = require('fs');
 const path = require('path');
@@ -19,6 +19,16 @@ const PUBLISHED_META_URL = 'https://stubenvolld.github.io/recall-data/meta.json'
 const MIN_RECALLS = 10000;          // we normally see ~13,600
 const MAX_DROP = 0.98;              // must keep at least 98% of last time's recalls
 const MAX_SKIPPED_SHARE = 0.01;     // junk rows must stay under 1%
+const MAX_REFEREE_MISSING = 0.25;   // fail if we're missing over 25% of the live API's recalls
+
+// REFEREE CARS — well-known cars we compare against NHTSA's live API
+const REFEREE_CARS = [
+  { year: 2024, make: 'LEXUS', model: 'NX HYBRID' },
+  { year: 2021, make: 'HONDA', model: 'CR-V' },
+  { year: 2024, make: 'FORD', model: 'F-150' },
+  { year: 2024, make: 'TOYOTA', model: 'TACOMA' },
+  { year: 2024, make: 'FORD', model: 'EXPLORER' },
+];
 
 // Column numbers from Lesson 6 (JavaScript counts from 0, so subtract 1)
 const COL = {
@@ -59,7 +69,7 @@ function writeJson(filePath, data) {
   totalBytes += Buffer.byteLength(text);
 }
 
-// ---------- NEW: READ LAST TIME'S NUMBERS FROM OUR OWN PUBLISHED SITE ----------
+// ---------- READ LAST TIME'S NUMBERS FROM OUR OWN PUBLISHED SITE ----------
 async function getPublishedMeta() {
   try {
     const response = await fetch(PUBLISHED_META_URL);
@@ -92,7 +102,7 @@ async function downloadAndUnzip() {
   console.log('Unzipped.\n');
 }
 
-// ---------- NEW: SANITY CHECKS ----------
+// ---------- SANITY CHECKS ----------
 function sanityCheck({ recallCount, vehicleRows, skippedRows }, previous) {
   console.log('Running safety checks…');
 
@@ -122,6 +132,55 @@ function sanityCheck({ recallCount, vehicleRows, skippedRows }, previous) {
   console.log(`  ✓ Unreadable rows: ${(skippedShare * 100).toFixed(2)}% (limit ${MAX_SKIPPED_SHARE * 100}%)`);
 
   console.log('All safety checks passed.\n');
+}
+
+// ---------- NEW: THE REFEREE ----------
+async function refereeCheck(vehicles) {
+  console.log('Running referee check against NHTSA live API…');
+
+  let liveTotal = 0;      // recalls the live API knows about, across all referee cars
+  let missingTotal = 0;   // of those, how many our files DON'T have
+  let carsChecked = 0;
+
+  for (const car of REFEREE_CARS) {
+    const label = `${car.year} ${car.make} ${car.model}`;
+    const ours = vehicles.get(car.year)?.get(car.make)?.get(car.model) || new Set();
+
+    // Ask the live API about this one car
+    let live;
+    try {
+      const url = `https://api.nhtsa.gov/recalls/recallsByVehicle?make=${encodeURIComponent(car.make)}&model=${encodeURIComponent(car.model)}&modelYear=${car.year}`;
+      const response = await fetch(url);
+      if (!response.ok) throw new Error(`code ${response.status}`);
+      const data = await response.json();
+      live = new Set((data.results || []).map((r) => r.NHTSACampaignNumber));
+    } catch (err) {
+      console.log(`  – ${label}: couldn't reach the live API (${err.message}), skipping`);
+      continue;
+    }
+
+    carsChecked += 1;
+    const missing = [...live].filter((c) => !ours.has(c));
+    liveTotal += live.size;
+    missingTotal += missing.length;
+
+    if (missing.length === 0) {
+      console.log(`  ✓ ${label}: ours ${ours.size}, live ${live.size}`);
+    } else {
+      console.log(`  ⚠ ${label}: ours ${ours.size}, live ${live.size} — missing ${missing.join(', ')}`);
+    }
+  }
+
+  // Judge the overall result
+  if (carsChecked === 0) {
+    console.log('Referee skipped: live API unreachable. Publishing anyway (other checks passed).\n');
+    return;
+  }
+  const missingShare = liveTotal === 0 ? 0 : missingTotal / liveTotal;
+  if (missingShare > MAX_REFEREE_MISSING) {
+    throw new Error(`Referee failed: our files are missing ${missingTotal} of ${liveTotal} recalls the live API reports.`);
+  }
+  console.log(`Referee passed: missing ${missingTotal} of ${liveTotal} live recalls (limit ${MAX_REFEREE_MISSING * 100}%).\n`);
 }
 
 // ---------- BUILD: read, organize, check, write ----------
@@ -188,8 +247,9 @@ async function build(previous) {
     recallVehicles.get(campaign).add(`${year}|${make}|${model}`);
   }
 
-  // NEW: check the numbers BEFORE writing anything
+  // Check the numbers BEFORE writing anything
   sanityCheck({ recallCount: recalls.size, vehicleRows, skippedRows }, previous);
+  await refereeCheck(vehicles);
 
   // ---------- WRITE THE TIDY FILES ----------
 
@@ -277,4 +337,4 @@ async function main() {
 main().catch((err) => {
   console.error(`\nBUILD FAILED: ${err.message}`);
   process.exit(1);
-}); 
+});
