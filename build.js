@@ -1,5 +1,5 @@
 // build.js — turns NHTSA's giant recall file into tidy files for the app
-// LESSON 8, STEP 7b VERSION: adds the referee (compare against NHTSA's live API)
+// LESSON 8, STEP 7c VERSION: skips the work if NHTSA's file hasn't changed
 
 const fs = require('fs');
 const path = require('path');
@@ -80,6 +80,25 @@ async function getPublishedMeta() {
   }
 }
 
+// ---------- NEW: ASK NHTSA FOR THE FILE'S STAMP (WITHOUT DOWNLOADING IT) ----------
+async function getSourceStamp() {
+  try {
+    const response = await fetch(ZIP_URL, { method: 'HEAD' });   // HEAD = "just the label, not the file"
+    if (!response.ok) return null;
+    return response.headers.get('etag') || response.headers.get('last-modified') || null;
+  } catch (err) {
+    return null;                              // can't get a stamp — we'll just build to be safe
+  }
+}
+
+// ---------- NEW: TELL GITHUB ACTIONS WHETHER ANYTHING CHANGED ----------
+function reportChanged(changed) {
+  // GITHUB_OUTPUT only exists on GitHub's computer. On your Mac, this does nothing.
+  if (process.env.GITHUB_OUTPUT) {
+    fs.appendFileSync(process.env.GITHUB_OUTPUT, `changed=${changed}\n`);
+  }
+}
+
 // ---------- DOWNLOAD AND UNZIP ----------
 async function downloadAndUnzip() {
   fs.mkdirSync('raw', { recursive: true });
@@ -134,7 +153,7 @@ function sanityCheck({ recallCount, vehicleRows, skippedRows }, previous) {
   console.log('All safety checks passed.\n');
 }
 
-// ---------- NEW: THE REFEREE ----------
+// ---------- THE REFEREE ----------
 async function refereeCheck(vehicles) {
   console.log('Running referee check against NHTSA live API…');
 
@@ -184,7 +203,7 @@ async function refereeCheck(vehicles) {
 }
 
 // ---------- BUILD: read, organize, check, write ----------
-async function build(previous) {
+async function build(previous, sourceStamp) {
   // TABLE 1 — recalls: one entry per recall number, holding its details
   const recalls = new Map();
 
@@ -261,6 +280,7 @@ async function build(previous) {
   // FILE 1: meta.json — the "front page" (and the robot's memory for next time)
   writeJson(`${OUT}/meta.json`, {
     builtAt: new Date().toISOString(),
+    sourceStamp,                 // NEW: NHTSA's file stamp, so next time we can tell if it changed
     recallCount: recalls.size,
     vehicleRows,
     years,
@@ -329,8 +349,24 @@ async function build(previous) {
 // ---------- RUN EVERYTHING, IN ORDER ----------
 async function main() {
   const previous = await getPublishedMeta();
+  const sourceStamp = await getSourceStamp();
+  const forced = process.env.FORCE_BUILD === 'true';
+
+  console.log(`NHTSA file stamp now:     ${sourceStamp || 'unknown'}`);
+  console.log(`Stamp at last publish:    ${(previous && previous.sourceStamp) || 'none'}`);
+  console.log(`Forced rebuild:           ${forced ? 'yes' : 'no'}\n`);
+
+  // NEW: skip everything if NHTSA's file is exactly the one we already published
+  if (!forced && sourceStamp && previous && previous.sourceStamp === sourceStamp) {
+    console.log('NHTSA file unchanged since last publish. Skipping build; current files stay live.');
+    reportChanged(false);
+    console.log('\nNOTHING TO DO');
+    return;
+  }
+
   await downloadAndUnzip();
-  await build(previous);
+  await build(previous, sourceStamp);
+  reportChanged(true);
   console.log('\nBUILD SUCCEEDED');
 }
 
