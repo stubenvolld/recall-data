@@ -21,6 +21,8 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest     # borrow a fresh Linux computer from GitHub
+    outputs:
+      changed: ${{ steps.build.outputs.changed }}   # pass "did anything change?" to the deploy job
     steps:
       - name: Get the code
         uses: actions/checkout@v6
@@ -34,18 +36,24 @@ jobs:
         run: npm ci            # installs adm-zip, exactly as listed in package-lock.json
 
       - name: Build the recall files
+        id: build              # a name so later steps can read this step's answer
         run: node build.js     # downloads NHTSA's file and builds everything
+        env:
+          FORCE_BUILD: ${{ github.event_name != 'schedule' }}   # always rebuild unless it's the schedule
 
       - name: Prepare Pages
+        if: steps.build.outputs.changed == 'true'               # only if something changed
         uses: actions/configure-pages@v6
 
       - name: Package the output folder
+        if: steps.build.outputs.changed == 'true'               # only if something changed
         uses: actions/upload-pages-artifact@v5
         with:
           path: output         # only the tidy files get published
 
   deploy:
     needs: build               # only publish if the build succeeded
+    if: needs.build.outputs.changed == 'true'                   # and only if something changed
     runs-on: ubuntu-latest
     environment:
       name: github-pages
@@ -53,5 +61,4 @@ jobs:
     steps:
       - name: Publish to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v5 
-        
+        uses: actions/deploy-pages@v5
