@@ -1,0 +1,57 @@
+# The robot's instructions: when to run, and what to do
+
+name: Build and publish recall data
+
+on:
+  schedule:
+    - cron: '17 10,22 * * *'   # twice a day: 10:17 and 22:17 UTC (about 6am and 6pm Eastern)
+  workflow_dispatch:           # adds a "Run workflow" button so you can start it by hand
+  push:
+    branches: [main]           # also run whenever you upload new code
+
+permissions:
+  contents: read               # the robot can read your code
+  pages: write                 # ...and publish to Pages
+  id-token: write              # ...and prove to Pages it's really your robot
+
+concurrency:
+  group: pages
+  cancel-in-progress: false    # never run two publishes at the same time
+
+jobs:
+  build:
+    runs-on: ubuntu-latest     # borrow a fresh Linux computer from GitHub
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v6
+
+      - name: Set up Node
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24     # same Node version as your Mac
+
+      - name: Install add-ons
+        run: npm ci            # installs adm-zip, exactly as listed in package-lock.json
+
+      - name: Build the recall files
+        run: node build.js     # downloads NHTSA's file and builds everything
+
+      - name: Prepare Pages
+        uses: actions/configure-pages@v6
+
+      - name: Package the output folder
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: output         # only the tidy files get published
+
+  deploy:
+    needs: build               # only publish if the build succeeded
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Publish to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5 
+        
