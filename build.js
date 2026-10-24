@@ -1,5 +1,5 @@
 // build.js — turns NHTSA's giant recall file into tidy files for the app
-// LESSON 8, STEP 1 VERSION: downloads the file itself, then builds
+// LESSON 8, STEP 7a VERSION: adds sanity checks before publishing
 
 const fs = require('fs');
 const path = require('path');
@@ -11,6 +11,14 @@ const ZIP_URL = 'https://static.nhtsa.gov/odi/ffdd/rcl/FLAT_RCL_POST_2010.zip';
 const ZIP_FILE = 'raw/FLAT_RCL_POST_2010.zip';
 const RAW_FILE = 'raw/FLAT_RCL_POST_2010.txt';
 const OUT = 'output';
+
+// Our own published "front page" — the robot's memory of last time
+const PUBLISHED_META_URL = 'https://stubenvolld.github.io/recall-data/meta.json';
+
+// SAFETY LIMITS — if the new data breaks any of these, we refuse to publish
+const MIN_RECALLS = 10000;          // we normally see ~13,600
+const MAX_DROP = 0.98;              // must keep at least 98% of last time's recalls
+const MAX_SKIPPED_SHARE = 0.01;     // junk rows must stay under 1%
 
 // Column numbers from Lesson 6 (JavaScript counts from 0, so subtract 1)
 const COL = {
@@ -51,7 +59,18 @@ function writeJson(filePath, data) {
   totalBytes += Buffer.byteLength(text);
 }
 
-// ---------- NEW: DOWNLOAD AND UNZIP ----------
+// ---------- NEW: READ LAST TIME'S NUMBERS FROM OUR OWN PUBLISHED SITE ----------
+async function getPublishedMeta() {
+  try {
+    const response = await fetch(PUBLISHED_META_URL);
+    if (!response.ok) return null;            // e.g. the very first run, nothing published yet
+    return await response.json();
+  } catch (err) {
+    return null;                              // can't reach it — skip the comparison, don't crash
+  }
+}
+
+// ---------- DOWNLOAD AND UNZIP ----------
 async function downloadAndUnzip() {
   fs.mkdirSync('raw', { recursive: true });
 
@@ -73,8 +92,40 @@ async function downloadAndUnzip() {
   console.log('Unzipped.\n');
 }
 
-// ---------- BUILD: read, organize, write ----------
-async function build() {
+// ---------- NEW: SANITY CHECKS ----------
+function sanityCheck({ recallCount, vehicleRows, skippedRows }, previous) {
+  console.log('Running safety checks…');
+
+  // Check 1: a floor — far fewer recalls than normal means a broken download
+  if (recallCount < MIN_RECALLS) {
+    throw new Error(`Only ${recallCount} recalls found (minimum is ${MIN_RECALLS}). The download may be broken.`);
+  }
+  console.log(`  ✓ Recall count ${recallCount.toLocaleString()} is above the ${MIN_RECALLS.toLocaleString()} minimum`);
+
+  // Check 2: no sudden drop compared to what we published last time
+  if (previous && previous.recallCount) {
+    const lowestAllowed = Math.floor(previous.recallCount * MAX_DROP);
+    if (recallCount < lowestAllowed) {
+      throw new Error(`Recalls dropped from ${previous.recallCount} to ${recallCount}. Refusing to publish.`);
+    }
+    const change = recallCount - previous.recallCount;
+    console.log(`  ✓ Compared to last publish: ${previous.recallCount.toLocaleString()} → ${recallCount.toLocaleString()} (${change >= 0 ? '+' : ''}${change})`);
+  } else {
+    console.log('  – No previous publish found to compare against (fine on a first run)');
+  }
+
+  // Check 3: junk rows stay rare — a jump means NHTSA may have changed the columns
+  const skippedShare = skippedRows / vehicleRows;
+  if (skippedShare > MAX_SKIPPED_SHARE) {
+    throw new Error(`${(skippedShare * 100).toFixed(1)}% of rows were unreadable. NHTSA may have changed the file layout.`);
+  }
+  console.log(`  ✓ Unreadable rows: ${(skippedShare * 100).toFixed(2)}% (limit ${MAX_SKIPPED_SHARE * 100}%)`);
+
+  console.log('All safety checks passed.\n');
+}
+
+// ---------- BUILD: read, organize, check, write ----------
+async function build(previous) {
   // TABLE 1 — recalls: one entry per recall number, holding its details
   const recalls = new Map();
 
@@ -137,6 +188,9 @@ async function build() {
     recallVehicles.get(campaign).add(`${year}|${make}|${model}`);
   }
 
+  // NEW: check the numbers BEFORE writing anything
+  sanityCheck({ recallCount: recalls.size, vehicleRows, skippedRows }, previous);
+
   // ---------- WRITE THE TIDY FILES ----------
 
   // Start fresh each time so old files never linger
@@ -144,10 +198,11 @@ async function build() {
 
   const years = [...vehicles.keys()].sort((a, b) => b - a);   // newest first
 
-  // FILE 1: meta.json — the "front page"
+  // FILE 1: meta.json — the "front page" (and the robot's memory for next time)
   writeJson(`${OUT}/meta.json`, {
     builtAt: new Date().toISOString(),
     recallCount: recalls.size,
+    vehicleRows,
     years,
   });
 
@@ -213,12 +268,13 @@ async function build() {
 
 // ---------- RUN EVERYTHING, IN ORDER ----------
 async function main() {
+  const previous = await getPublishedMeta();
   await downloadAndUnzip();
-  await build();
+  await build(previous);
   console.log('\nBUILD SUCCEEDED');
 }
 
 main().catch((err) => {
   console.error(`\nBUILD FAILED: ${err.message}`);
   process.exit(1);
-});
+}); 
