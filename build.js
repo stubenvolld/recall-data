@@ -1,5 +1,5 @@
 // build.js — turns NHTSA's giant recall file into tidy files for the app
-// LESSON 8, STEP 7c VERSION: skips the work if NHTSA's file hasn't changed
+// LESSON 9 VERSION: merges different spellings of the same make (e.g. MERCEDES-BENZ)
 
 const fs = require('fs');
 const path = require('path');
@@ -58,6 +58,21 @@ function slug(text) {
   return text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
 }
 
+// ---------- NEW: ONE NAME PER MAKE ----------
+// NHTSA sometimes spells the same make two ways ("MERCEDES-BENZ" vs "MERCEDES BENZ").
+// Both turn into the same file name, so the second would overwrite the first.
+// Fix: the first spelling we see becomes THE name; later spellings are merged into it.
+const makeNames = new Map();     // file name (slug) -> the one spelling we use
+const mergedMakes = new Map();   // spelling we folded in -> spelling we kept
+function canonicalMake(make) {
+  if (!make) return make;
+  const key = slug(make);
+  if (!makeNames.has(key)) makeNames.set(key, make);
+  const kept = makeNames.get(key);
+  if (kept !== make) mergedMakes.set(make, kept);
+  return kept;
+}
+
 // Saves data as a JSON file, creating folders as needed, and tracks totals
 let fileCount = 0;
 let totalBytes = 0;
@@ -80,7 +95,7 @@ async function getPublishedMeta() {
   }
 }
 
-// ---------- NEW: ASK NHTSA FOR THE FILE'S STAMP (WITHOUT DOWNLOADING IT) ----------
+// ---------- ASK NHTSA FOR THE FILE'S STAMP (WITHOUT DOWNLOADING IT) ----------
 async function getSourceStamp() {
   try {
     const response = await fetch(ZIP_URL, { method: 'HEAD' });   // HEAD = "just the label, not the file"
@@ -91,7 +106,7 @@ async function getSourceStamp() {
   }
 }
 
-// ---------- NEW: TELL GITHUB ACTIONS WHETHER ANYTHING CHANGED ----------
+// ---------- TELL GITHUB ACTIONS WHETHER ANYTHING CHANGED ----------
 function reportChanged(changed) {
   // GITHUB_OUTPUT only exists on GitHub's computer. On your Mac, this does nothing.
   if (process.env.GITHUB_OUTPUT) {
@@ -227,7 +242,7 @@ async function build(previous, sourceStamp) {
     vehicleRows += 1;
 
     const campaign = (cols[COL.campaign] || '').trim();
-    const make = clean(cols[COL.make]);
+    const make = canonicalMake(clean(cols[COL.make]));   // NEW: one name per make
     const model = clean(cols[COL.model]);
     const year = Number(cols[COL.year]);
 
@@ -266,6 +281,13 @@ async function build(previous, sourceStamp) {
     recallVehicles.get(campaign).add(`${year}|${make}|${model}`);
   }
 
+  // NEW: show which spellings got merged, so nothing happens silently
+  if (mergedMakes.size > 0) {
+    console.log('Merged make spellings:');
+    for (const [from, to] of mergedMakes) console.log(`  "${from}" → "${to}"`);
+    console.log('');
+  }
+
   // Check the numbers BEFORE writing anything
   sanityCheck({ recallCount: recalls.size, vehicleRows, skippedRows }, previous);
   await refereeCheck(vehicles);
@@ -280,7 +302,7 @@ async function build(previous, sourceStamp) {
   // FILE 1: meta.json — the "front page" (and the robot's memory for next time)
   writeJson(`${OUT}/meta.json`, {
     builtAt: new Date().toISOString(),
-    sourceStamp,                 // NEW: NHTSA's file stamp, so next time we can tell if it changed
+    sourceStamp,                 // NHTSA's file stamp, so next time we can tell if it changed
     recallCount: recalls.size,
     vehicleRows,
     years,
@@ -342,6 +364,7 @@ async function build(previous, sourceStamp) {
   console.log(`Rows skipped:        ${skippedRows.toLocaleString()}`);
   console.log(`Unique recalls:      ${recalls.size.toLocaleString()}`);
   console.log(`Model years:         ${years.length} (${years[years.length - 1]}–${years[0]})`);
+  console.log(`Makes merged:        ${mergedMakes.size}`);
   console.log(`Files written:       ${fileCount.toLocaleString()}`);
   console.log(`Total size:          ${(totalBytes / 1024 / 1024).toFixed(1)} MB`);
 }
@@ -356,7 +379,7 @@ async function main() {
   console.log(`Stamp at last publish:    ${(previous && previous.sourceStamp) || 'none'}`);
   console.log(`Forced rebuild:           ${forced ? 'yes' : 'no'}\n`);
 
-  // NEW: skip everything if NHTSA's file is exactly the one we already published
+  // Skip everything if NHTSA's file is exactly the one we already published
   if (!forced && sourceStamp && previous && previous.sourceStamp === sourceStamp) {
     console.log('NHTSA file unchanged since last publish. Skipping build; current files stay live.');
     reportChanged(false);
