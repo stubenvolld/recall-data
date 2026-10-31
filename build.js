@@ -1,5 +1,5 @@
 // build.js — turns NHTSA's giant recall file into tidy files for the app
-// LESSON 9 VERSION: merges different spellings of the same make (e.g. MERCEDES-BENZ)
+// LESSON 10 VERSION: adds NHTSA's "Do Not Drive" and "Park Outside" warnings
 
 const fs = require('fs');
 const path = require('path');
@@ -30,7 +30,7 @@ const REFEREE_CARS = [
   { year: 2024, make: 'FORD', model: 'EXPLORER' },
 ];
 
-// Column numbers from Lesson 6 (JavaScript counts from 0, so subtract 1)
+// Column numbers from the data dictionary (JavaScript counts from 0, so subtract 1)
 const COL = {
   campaign: 1,       // column 2:  recall number
   make: 2,           // column 3
@@ -44,6 +44,8 @@ const COL = {
   description: 19,   // column 20
   consequence: 20,   // column 21
   remedy: 21,        // column 22
+  doNotDrive: 27,    // NEW — column 28: NHTSA consumer advisory "Do Not Drive" (text: Yes/No)
+  parkOutside: 28,   // NEW — column 29: NHTSA consumer advisory "Park Outside" (text: Yes/No)
 };
 
 const NEWEST_YEAR = new Date().getFullYear() + 2;
@@ -53,12 +55,17 @@ function clean(text) {
   return (text || '').trim().toUpperCase();
 }
 
+// NEW: is this text a "Yes"? Handles Yes, YES, yes, extra spaces, and blanks safely
+function isYes(text) {
+  return clean(text) === 'YES';
+}
+
 // Turns a name into a safe file name: "ROYAL TRUCK & EQUIPMENT" -> "royal-truck-equipment"
 function slug(text) {
   return text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
 }
 
-// ---------- NEW: ONE NAME PER MAKE ----------
+// ---------- ONE NAME PER MAKE ----------
 // NHTSA sometimes spells the same make two ways ("MERCEDES-BENZ" vs "MERCEDES BENZ").
 // Both turn into the same file name, so the second would overwrite the first.
 // Fix: the first spelling we see becomes THE name; later spellings are merged into it.
@@ -242,7 +249,7 @@ async function build(previous, sourceStamp) {
     vehicleRows += 1;
 
     const campaign = (cols[COL.campaign] || '').trim();
-    const make = canonicalMake(clean(cols[COL.make]));   // NEW: one name per make
+    const make = canonicalMake(clean(cols[COL.make]));   // one name per make
     const model = clean(cols[COL.model]);
     const year = Number(cols[COL.year]);
 
@@ -263,10 +270,18 @@ async function build(previous, sourceStamp) {
         affected: Number(cols[COL.affected]) || null,
         buildStart: (cols[COL.buildStart] || '').trim() || null,
         buildEnd: (cols[COL.buildEnd] || '').trim() || null,
+        doNotDrive: false,      // NEW — turned on below if ANY row says Yes
+        parkOutside: false,     // NEW
       });
     }
+    const recall = recalls.get(campaign);
     const component = (cols[COL.component] || '').trim();
-    if (component) recalls.get(campaign).components.add(component);
+    if (component) recall.components.add(component);
+
+    // NEW: if ANY row of this recall says Yes, the warning is on.
+    // (Safer than trusting only the first row — a warning should never be missed.)
+    if (isYes(cols[COL.doNotDrive])) recall.doNotDrive = true;
+    if (isYes(cols[COL.parkOutside])) recall.parkOutside = true;
 
     // TABLE 2: file this recall under year -> make -> model
     if (!vehicles.has(year)) vehicles.set(year, new Map());
@@ -281,7 +296,7 @@ async function build(previous, sourceStamp) {
     recallVehicles.get(campaign).add(`${year}|${make}|${model}`);
   }
 
-  // NEW: show which spellings got merged, so nothing happens silently
+  // Show which spellings got merged, so nothing happens silently
   if (mergedMakes.size > 0) {
     console.log('Merged make spellings:');
     for (const [from, to] of mergedMakes) console.log(`  "${from}" → "${to}"`);
@@ -319,13 +334,20 @@ async function build(previous, sourceStamp) {
 
       for (const [model, campaigns] of models) {
         campaigns.forEach((c) => makeCampaigns.add(c));
+        const recallList = [...campaigns].sort().map((c) => {
+          const r = recalls.get(c);
+          return {
+            campaign: c,
+            title: [...r.components][0] || 'Unknown part',
+            doNotDrive: r.doNotDrive,     // NEW — so the list screen can show a badge
+            parkOutside: r.parkOutside,   // NEW
+          };
+        });
         modelList.push({
           model,
           recallCount: campaigns.size,
-          recalls: [...campaigns].sort().map((c) => ({
-            campaign: c,
-            title: [...recalls.get(c).components][0] || 'Unknown part',
-          })),
+          warningCount: recallList.filter((r) => r.doNotDrive || r.parkOutside).length,   // NEW
+          recalls: recallList,
         });
       }
 
@@ -360,11 +382,22 @@ async function build(previous, sourceStamp) {
   }
 
   // ---------- REPORT ----------
+  const all = [...recalls.values()];
+  const dndOnly = all.filter((r) => r.doNotDrive && !r.parkOutside);
+  const parkOnly = all.filter((r) => !r.doNotDrive && r.parkOutside);
+  const both = all.filter((r) => r.doNotDrive && r.parkOutside);
+
   console.log(`Vehicle rows read:   ${vehicleRows.toLocaleString()}`);
   console.log(`Rows skipped:        ${skippedRows.toLocaleString()}`);
   console.log(`Unique recalls:      ${recalls.size.toLocaleString()}`);
   console.log(`Model years:         ${years.length} (${years[years.length - 1]}–${years[0]})`);
   console.log(`Makes merged:        ${mergedMakes.size}`);
+  console.log(`Do Not Drive only:   ${dndOnly.length}`);
+  console.log(`Park Outside only:   ${parkOnly.length}`);
+  console.log(`Both warnings:       ${both.length}`);
+  if (dndOnly[0]) console.log(`  Example Do Not Drive recall:  ${dndOnly[0].campaign}`);
+  if (parkOnly[0]) console.log(`  Example Park Outside recall:  ${parkOnly[0].campaign}`);
+  if (both[0]) console.log(`  Example "both" recall:        ${both[0].campaign}`);
   console.log(`Files written:       ${fileCount.toLocaleString()}`);
   console.log(`Total size:          ${(totalBytes / 1024 / 1024).toFixed(1)} MB`);
 }
