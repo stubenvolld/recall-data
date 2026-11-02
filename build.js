@@ -1,5 +1,5 @@
 // build.js — turns NHTSA's giant recall file into tidy files for the app
-// LESSON 13A VERSION: removes the old "models" list (the app now reads only "families")
+// LESSON 14 VERSION (B): last 20 model years, PLUS urgent recalls for older vehicles
 
 const fs = require('fs');
 const path = require('path');
@@ -15,11 +15,17 @@ const OUT = 'output';
 // Our own published "front page" — the robot's memory of last time
 const PUBLISHED_META_URL = 'https://stubenvolld.github.io/recall-data/meta.json';
 
-// SAFETY LIMITS — if the new data breaks any of these, we refuse to publish
-const MIN_RECALLS = 10000;          // we normally see ~13,600
-const MAX_DROP = 0.98;              // must keep at least 98% of last time's recalls
-const MAX_SKIPPED_SHARE = 0.01;     // junk rows must stay under 1%
-const MAX_REFEREE_MISSING = 0.25;   // fail if we're missing over 25% of the live API's recalls
+// MODEL-YEAR WINDOW — the app shows all recalls for recent model years.
+// Older vehicles appear ONLY if they have an urgent recall (Do Not Drive / Park Outside).
+const YEARS_TO_PUBLISH = 20;
+const NEWEST_YEAR = new Date().getFullYear() + 2;
+const OLDEST_YEAR = new Date().getFullYear() - (YEARS_TO_PUBLISH - 1);   // e.g. 2007
+
+// SAFETY LIMITS (these measure NHTSA's WHOLE file, so trimming years doesn't trip them)
+const MIN_RECALLS = 10000;
+const MAX_DROP = 0.98;
+const MAX_SKIPPED_SHARE = 0.01;
+const MAX_REFEREE_MISSING = 0.25;
 
 // REFEREE CARS — well-known cars we compare against NHTSA's live API
 const REFEREE_CARS = [
@@ -32,42 +38,28 @@ const REFEREE_CARS = [
 
 // Column numbers from the data dictionary (JavaScript counts from 0, so subtract 1)
 const COL = {
-  campaign: 1,       // column 2:  recall number
-  make: 2,           // column 3
-  model: 3,          // column 4
-  year: 4,           // column 5
-  component: 6,      // column 7:  part affected
-  buildStart: 8,     // column 9:  first build date (sometimes blank)
-  buildEnd: 9,       // column 10: last build date (sometimes blank)
-  type: 10,          // column 11: V = vehicle
-  affected: 11,      // column 12: vehicles affected
-  description: 19,   // column 20
-  consequence: 20,   // column 21
-  remedy: 21,        // column 22
-  doNotDrive: 27,    // column 28: NHTSA consumer advisory "Do Not Drive" (text: Yes/No)
-  parkOutside: 28,   // column 29: NHTSA consumer advisory "Park Outside" (text: Yes/No)
+  campaign: 1, make: 2, model: 3, year: 4, component: 6,
+  buildStart: 8, buildEnd: 9, type: 10, affected: 11,
+  description: 19, consequence: 20, remedy: 21,
+  doNotDrive: 27,    // column 28: "Do Not Drive" (text: Yes/No)
+  parkOutside: 28,   // column 29: "Park Outside" (text: Yes/No)
 };
 
-const NEWEST_YEAR = new Date().getFullYear() + 2;
-
-// Trims spaces and makes capitals consistent
 function clean(text) {
   return (text || '').trim().toUpperCase();
 }
 
-// Is this text a "Yes"? Handles Yes, YES, yes, extra spaces, and blanks safely
 function isYes(text) {
   return clean(text) === 'YES';
 }
 
-// Turns a name into a safe file name: "ROYAL TRUCK & EQUIPMENT" -> "royal-truck-equipment"
 function slug(text) {
   return text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
 }
 
 // ---------- ONE NAME PER MAKE ----------
-const makeNames = new Map();     // file name (slug) -> the one spelling we use
-const mergedMakes = new Map();   // spelling we folded in -> spelling we kept
+const makeNames = new Map();
+const mergedMakes = new Map();
 function canonicalMake(make) {
   if (!make) return make;
   const key = slug(make);
@@ -77,22 +69,11 @@ function canonicalMake(make) {
   return kept;
 }
 
-// ---------- FAMILIES (tested in preview-families.js) ----------
-
-// Words that describe a VERSION of a car (powertrain or package), not a different car.
-// Longer phrases come first, so "PLUG-IN HYBRID" is removed before "HYBRID" could be.
+// ---------- FAMILIES ----------
 const VERSION_WORDS = [
-  'PLUG-IN HYBRID',
-  'INCOMPLETE CHASSIS',
-  'HYBRID',
-  'PHEV',
-  'BEV',
-  'PRIME',
-  'SD',
-  'CHASSIS',
+  'PLUG-IN HYBRID', 'INCOMPLETE CHASSIS', 'HYBRID', 'PHEV', 'BEV', 'PRIME', 'SD', 'CHASSIS',
 ];
 
-// Removes version words from the END of a name, repeating until none are left
 function stripVersion(model) {
   let name = model;
   let changed = true;
@@ -104,7 +85,7 @@ function stripVersion(model) {
         changed = true;
       }
     }
-    const xdrive = name.match(/^(.*) XDRIVE\d*$/);   // BMW: XDRIVE, XDRIVE60, ...
+    const xdrive = name.match(/^(.*) XDRIVE\d*$/);
     if (xdrive) {
       name = xdrive[1];
       changed = true;
@@ -113,10 +94,6 @@ function stripVersion(model) {
   return name;
 }
 
-// The family rule:
-// 1. Strip version words from the end.
-// 2. If what's left is ONE word of letters glued to a number (NX250),
-//    AND those letters exist on their own as a family (NX), use just the letters.
 function familyOf(model, baseNames) {
   const base = stripVersion(model);
   const glued = base.match(/^([A-Z]+)\d+[A-Z+]*$/);
@@ -124,10 +101,6 @@ function familyOf(model, baseNames) {
   return base;
 }
 
-// "See also": which other families in the same make + year are related?
-// Rule A: one name extends the other     ("BRONCO" <-> "BRONCO SPORT", "VENZA" <-> "REDUNDANT VENZA")
-// Rule B: BMW-style series                ("3 SERIES" <-> "330I", "330E")
-// Rule C: share the first two words, both 3+ words ("K 1600 GT" <-> "K 1600 GTL")
 function seriesDigit(name) {
   const m = name.match(/^(\d) SERIES$/);
   return m ? m[1] : null;
@@ -138,27 +111,23 @@ function relatedFamilies(name, allFamilies) {
   for (const other of allFamilies) {
     if (other === name) continue;
     const theirWords = other.split(' ');
-
     const ruleA =
       other.startsWith(name + ' ') || other.endsWith(' ' + name) ||
       name.startsWith(other + ' ') || name.endsWith(' ' + other);
-
     const mySeries = seriesDigit(name);
     const theirSeries = seriesDigit(other);
     const ruleB =
       (mySeries && /^\d/.test(other) && other[0] === mySeries) ||
       (theirSeries && /^\d/.test(name) && name[0] === theirSeries);
-
     const ruleC =
       myWords.length >= 3 && theirWords.length >= 3 &&
       myWords[0] === theirWords[0] && myWords[1] === theirWords[1];
-
     if (ruleA || ruleB || ruleC) related.push(other);
   }
   return related.sort();
 }
 
-// Saves data as a JSON file, creating folders as needed, and tracks totals
+// ---------- FILE WRITING ----------
 let fileCount = 0;
 let totalBytes = 0;
 function writeJson(filePath, data) {
@@ -169,7 +138,7 @@ function writeJson(filePath, data) {
   totalBytes += Buffer.byteLength(text);
 }
 
-// ---------- READ LAST TIME'S NUMBERS FROM OUR OWN PUBLISHED SITE ----------
+// ---------- ROBOT MEMORY / STAMP / GITHUB OUTPUT ----------
 async function getPublishedMeta() {
   try {
     const response = await fetch(PUBLISHED_META_URL);
@@ -180,7 +149,6 @@ async function getPublishedMeta() {
   }
 }
 
-// ---------- ASK NHTSA FOR THE FILE'S STAMP (WITHOUT DOWNLOADING IT) ----------
 async function getSourceStamp() {
   try {
     const response = await fetch(ZIP_URL, { method: 'HEAD' });
@@ -191,7 +159,6 @@ async function getSourceStamp() {
   }
 }
 
-// ---------- TELL GITHUB ACTIONS WHETHER ANYTHING CHANGED ----------
 function reportChanged(changed) {
   if (process.env.GITHUB_OUTPUT) {
     fs.appendFileSync(process.env.GITHUB_OUTPUT, `changed=${changed}\n`);
@@ -201,7 +168,6 @@ function reportChanged(changed) {
 // ---------- DOWNLOAD AND UNZIP ----------
 async function downloadAndUnzip() {
   fs.mkdirSync('raw', { recursive: true });
-
   console.log('Downloading NHTSA recall file…');
   const response = await fetch(ZIP_URL);
   if (!response.ok) {
@@ -210,32 +176,30 @@ async function downloadAndUnzip() {
   const zipData = Buffer.from(await response.arrayBuffer());
   fs.writeFileSync(ZIP_FILE, zipData);
   console.log(`Downloaded:          ${(zipData.length / 1024 / 1024).toFixed(1)} MB`);
-
   console.log('Unzipping…');
   new AdmZip(ZIP_FILE).extractAllTo('raw', true);
-
   if (!fs.existsSync(RAW_FILE)) {
     throw new Error(`Unzipped, but ${RAW_FILE} was not inside. NHTSA may have renamed it.`);
   }
   console.log('Unzipped.\n');
 }
 
-// ---------- SANITY CHECKS ----------
-function sanityCheck({ recallCount, vehicleRows, skippedRows }, previous) {
+// ---------- SANITY CHECKS (whole file) ----------
+function sanityCheck({ fileRecallCount, vehicleRows, skippedRows }, previous) {
   console.log('Running safety checks…');
-
-  if (recallCount < MIN_RECALLS) {
-    throw new Error(`Only ${recallCount} recalls found (minimum is ${MIN_RECALLS}). The download may be broken.`);
+  if (fileRecallCount < MIN_RECALLS) {
+    throw new Error(`Only ${fileRecallCount} recalls in NHTSA's file (minimum is ${MIN_RECALLS}). The download may be broken.`);
   }
-  console.log(`  ✓ Recall count ${recallCount.toLocaleString()} is above the ${MIN_RECALLS.toLocaleString()} minimum`);
+  console.log(`  ✓ NHTSA's file has ${fileRecallCount.toLocaleString()} recalls (minimum ${MIN_RECALLS.toLocaleString()})`);
 
-  if (previous && previous.recallCount) {
-    const lowestAllowed = Math.floor(previous.recallCount * MAX_DROP);
-    if (recallCount < lowestAllowed) {
-      throw new Error(`Recalls dropped from ${previous.recallCount} to ${recallCount}. Refusing to publish.`);
+  const previousFileCount = previous && (previous.fileRecallCount || previous.recallCount);
+  if (previousFileCount) {
+    const lowestAllowed = Math.floor(previousFileCount * MAX_DROP);
+    if (fileRecallCount < lowestAllowed) {
+      throw new Error(`NHTSA's file dropped from ${previousFileCount} to ${fileRecallCount} recalls. Refusing to publish.`);
     }
-    const change = recallCount - previous.recallCount;
-    console.log(`  ✓ Compared to last publish: ${previous.recallCount.toLocaleString()} → ${recallCount.toLocaleString()} (${change >= 0 ? '+' : ''}${change})`);
+    const change = fileRecallCount - previousFileCount;
+    console.log(`  ✓ Compared to last publish: ${previousFileCount.toLocaleString()} → ${fileRecallCount.toLocaleString()} (${change >= 0 ? '+' : ''}${change})`);
   } else {
     console.log('  – No previous publish found to compare against (fine on a first run)');
   }
@@ -245,14 +209,12 @@ function sanityCheck({ recallCount, vehicleRows, skippedRows }, previous) {
     throw new Error(`${(skippedShare * 100).toFixed(1)}% of rows were unreadable. NHTSA may have changed the file layout.`);
   }
   console.log(`  ✓ Unreadable rows: ${(skippedShare * 100).toFixed(2)}% (limit ${MAX_SKIPPED_SHARE * 100}%)`);
-
   console.log('All safety checks passed.\n');
 }
 
 // ---------- THE REFEREE ----------
 async function refereeCheck(vehicles) {
   console.log('Running referee check against NHTSA live API…');
-
   let liveTotal = 0;
   let missingTotal = 0;
   let carsChecked = 0;
@@ -260,7 +222,6 @@ async function refereeCheck(vehicles) {
   for (const car of REFEREE_CARS) {
     const label = `${car.year} ${car.make} ${car.model}`;
     const ours = vehicles.get(car.year)?.get(car.make)?.get(car.model) || new Set();
-
     let live;
     try {
       const url = `https://api.nhtsa.gov/recalls/recallsByVehicle?make=${encodeURIComponent(car.make)}&model=${encodeURIComponent(car.model)}&modelYear=${car.year}`;
@@ -272,12 +233,10 @@ async function refereeCheck(vehicles) {
       console.log(`  – ${label}: couldn't reach the live API (${err.message}), skipping`);
       continue;
     }
-
     carsChecked += 1;
     const missing = [...live].filter((c) => !ours.has(c));
     liveTotal += live.size;
     missingTotal += missing.length;
-
     if (missing.length === 0) {
       console.log(`  ✓ ${label}: ours ${ours.size}, live ${live.size}`);
     } else {
@@ -296,35 +255,20 @@ async function refereeCheck(vehicles) {
   console.log(`Referee passed: missing ${missingTotal} of ${liveTotal} live recalls (limit ${MAX_REFEREE_MISSING * 100}%).\n`);
 }
 
-// ---------- BUILD: read, organize, check, write ----------
+// ---------- BUILD ----------
 async function build(previous, sourceStamp) {
-  const recalls = new Map();          // TABLE 1 — recall number -> details
-  const vehicles = new Map();         // TABLE 2 — year -> make -> model -> recall numbers
-  const recallVehicles = new Map();   // TABLE 3 — recall number -> every car it affects
+  const recalls = new Map();          // recall number -> details
+  const vehicles = new Map();         // year -> make -> model -> recall numbers
+  const recallVehicles = new Map();   // recall number -> every car it affects
+  const fileCampaigns = new Set();    // every recall in NHTSA's file (for safety checks)
+  const urgentCampaigns = new Set();  // NEW: recalls with Do Not Drive / Park Outside on ANY row
+  const olderRows = [];               // NEW: the "maybe" pile — rows older than the window
 
   let vehicleRows = 0;
   let skippedRows = 0;
 
-  const reader = readline.createInterface({
-    input: fs.createReadStream(RAW_FILE),
-    crlfDelay: Infinity,
-  });
-
-  for await (const line of reader) {
-    const cols = line.split('\t');
-    if (cols[COL.type] !== 'V') continue;
-    vehicleRows += 1;
-
-    const campaign = (cols[COL.campaign] || '').trim();
-    const make = canonicalMake(clean(cols[COL.make]));
-    const model = clean(cols[COL.model]);
-    const year = Number(cols[COL.year]);
-
-    if (!campaign || !make || !model || !(year >= 1949 && year <= NEWEST_YEAR)) {
-      skippedRows += 1;
-      continue;
-    }
-
+  // NEW: one place that adds a row to the three tables (used for normal rows AND kept older rows)
+  function addRow(cols, campaign, make, model, year) {
     if (!recalls.has(campaign)) {
       recalls.set(campaign, {
         campaign,
@@ -356,29 +300,73 @@ async function build(previous, sourceStamp) {
     recallVehicles.get(campaign).add(`${year}|${make}|${model}`);
   }
 
+  const reader = readline.createInterface({
+    input: fs.createReadStream(RAW_FILE),
+    crlfDelay: Infinity,
+  });
+
+  for await (const line of reader) {
+    const cols = line.split('\t');
+    if (cols[COL.type] !== 'V') continue;
+    vehicleRows += 1;
+
+    const campaign = (cols[COL.campaign] || '').trim();
+    const make = canonicalMake(clean(cols[COL.make]));
+    const model = clean(cols[COL.model]);
+    const year = Number(cols[COL.year]);
+
+    if (!campaign || !make || !model || !(year >= 1949 && year <= NEWEST_YEAR)) {
+      skippedRows += 1;
+      continue;
+    }
+
+    fileCampaigns.add(campaign);
+    if (isYes(cols[COL.doNotDrive]) || isYes(cols[COL.parkOutside])) {
+      urgentCampaigns.add(campaign);
+    }
+
+    if (year < OLDEST_YEAR) {
+      olderRows.push({ cols, campaign, make, model, year });   // decide later, with the full picture
+      continue;
+    }
+    addRow(cols, campaign, make, model, year);
+  }
+
+  // NEW: from the "maybe" pile, keep only rows whose recall is urgent
+  let olderKept = 0;
+  for (const r of olderRows) {
+    if (urgentCampaigns.has(r.campaign)) {
+      addRow(r.cols, r.campaign, r.make, r.model, r.year);
+      olderKept += 1;
+    }
+  }
+
   if (mergedMakes.size > 0) {
     console.log('Merged make spellings:');
     for (const [from, to] of mergedMakes) console.log(`  "${from}" → "${to}"`);
     console.log('');
   }
 
-  sanityCheck({ recallCount: recalls.size, vehicleRows, skippedRows }, previous);
+  sanityCheck({ fileRecallCount: fileCampaigns.size, vehicleRows, skippedRows }, previous);
   await refereeCheck(vehicles);
 
-  // ---------- WRITE THE TIDY FILES ----------
+  // ---------- WRITE ----------
   fs.rmSync(OUT, { recursive: true, force: true });
 
   const years = [...vehicles.keys()].sort((a, b) => b - a);
+  const olderYears = years.filter((y) => y < OLDEST_YEAR);
 
   writeJson(`${OUT}/meta.json`, {
     builtAt: new Date().toISOString(),
     sourceStamp,
+    fileRecallCount: fileCampaigns.size,
     recallCount: recalls.size,
+    oldestYear: OLDEST_YEAR,
+    urgentOnlyBefore: OLDEST_YEAR,   // NEW: years below this show urgent recalls only
     vehicleRows,
     years,
   });
 
-  // A recall entry as it appears in a family's list
   function recallSummary(c) {
     const r = recalls.get(c);
     return {
@@ -389,7 +377,6 @@ async function build(previous, sourceStamp) {
     };
   }
 
-  let totalModels = 0;
   let totalFamilies = 0;
   let totalSeeAlso = 0;
 
@@ -403,9 +390,8 @@ async function build(previous, sourceStamp) {
         campaigns.forEach((c) => makeCampaigns.add(c));
       }
 
-      // ----- FAMILIES (the only list the app reads now) -----
       const baseNames = new Set([...models.keys()].map(stripVersion));
-      const familyMap = new Map();   // family -> { members: Set, campaigns: Set }
+      const familyMap = new Map();
       for (const [model, campaigns] of models) {
         const fam = familyOf(model, baseNames);
         if (!familyMap.has(fam)) familyMap.set(fam, { members: new Set(), campaigns: new Set() });
@@ -433,15 +419,10 @@ async function build(previous, sourceStamp) {
         };
       });
 
-      totalModels += models.size;
       totalFamilies += familyList.length;
 
       const makeSlug = slug(make);
-      writeJson(`${OUT}/years/${year}/${makeSlug}.json`, {
-        year,
-        make,
-        families: familyList,   // the old "models" list is gone
-      });
+      writeJson(`${OUT}/years/${year}/${makeSlug}.json`, { year, make, families: familyList });
 
       makeList.push({
         make,
@@ -475,15 +456,15 @@ async function build(previous, sourceStamp) {
   const parkOnly = all.filter((r) => !r.doNotDrive && r.parkOutside);
   const both = all.filter((r) => r.doNotDrive && r.parkOutside);
 
-  console.log(`Vehicle rows read:   ${vehicleRows.toLocaleString()}`);
-  console.log(`Rows skipped:        ${skippedRows.toLocaleString()}`);
-  console.log(`Unique recalls:      ${recalls.size.toLocaleString()}`);
-  console.log(`Model years:         ${years.length} (${years[years.length - 1]}–${years[0]})`);
-  console.log(`Makes merged:        ${mergedMakes.size}`);
+  console.log(`Model-year window:   ${OLDEST_YEAR}–${years[0]} (all recalls)`);
+  console.log(`Older years kept:    ${olderYears.length ? `${olderYears[olderYears.length - 1]}–${olderYears[0]}` : 'none'} (urgent recalls only)`);
+  console.log(`Older rows:          ${olderRows.length.toLocaleString()} set aside, ${olderKept.toLocaleString()} kept as urgent`);
+  console.log(`Recalls in file:     ${fileCampaigns.size.toLocaleString()}`);
+  console.log(`Recalls published:   ${recalls.size.toLocaleString()}`);
+  console.log(`Model years:         ${years.length}`);
   console.log(`Do Not Drive only:   ${dndOnly.length}`);
   console.log(`Park Outside only:   ${parkOnly.length}`);
   console.log(`Both warnings:       ${both.length}`);
-  console.log(`Model names:         ${totalModels.toLocaleString()}`);
   console.log(`Families:            ${totalFamilies.toLocaleString()}`);
   console.log(`Families w/ See also: ${totalSeeAlso.toLocaleString()}`);
   console.log(`Files written:       ${fileCount.toLocaleString()}`);
