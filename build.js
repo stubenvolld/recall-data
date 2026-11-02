@@ -1,5 +1,5 @@
 // build.js — turns NHTSA's giant recall file into tidy files for the app
-// LESSON 12 VERSION: adds FAMILIES (with filed-as labels and See also) to each make file
+// LESSON 13A VERSION: removes the old "models" list (the app now reads only "families")
 
 const fs = require('fs');
 const path = require('path');
@@ -77,7 +77,7 @@ function canonicalMake(make) {
   return kept;
 }
 
-// ---------- NEW: FAMILIES (tested in preview-families.js) ----------
+// ---------- FAMILIES (tested in preview-families.js) ----------
 
 // Words that describe a VERSION of a car (powertrain or package), not a different car.
 // Longer phrases come first, so "PLUG-IN HYBRID" is removed before "HYBRID" could be.
@@ -378,7 +378,7 @@ async function build(previous, sourceStamp) {
     years,
   });
 
-  // A recall entry as it appears in lists (shared by models and families)
+  // A recall entry as it appears in a family's list
   function recallSummary(c) {
     const r = recalls.get(c);
     return {
@@ -399,22 +399,11 @@ async function build(previous, sourceStamp) {
 
     for (const [make, models] of makes) {
       const makeCampaigns = new Set();
-
-      // ----- MODELS (unchanged, so today's app keeps working) -----
-      const modelList = [];
-      for (const [model, campaigns] of models) {
+      for (const campaigns of models.values()) {
         campaigns.forEach((c) => makeCampaigns.add(c));
-        const recallList = [...campaigns].sort().map(recallSummary);
-        modelList.push({
-          model,
-          recallCount: campaigns.size,
-          warningCount: recallList.filter((r) => r.doNotDrive || r.parkOutside).length,
-          recalls: recallList,
-        });
       }
-      modelList.sort((a, b) => a.model.localeCompare(b.model));
 
-      // ----- NEW: FAMILIES -----
+      // ----- FAMILIES (the only list the app reads now) -----
       const baseNames = new Set([...models.keys()].map(stripVersion));
       const familyMap = new Map();   // family -> { members: Set, campaigns: Set }
       for (const [model, campaigns] of models) {
@@ -430,7 +419,6 @@ async function build(previous, sourceStamp) {
         const memberList = [...members].sort();
         const recallList = [...campaigns].sort().map((c) => ({
           ...recallSummary(c),
-          // Which of this family's names was this recall filed under?
           filedAs: memberList.filter((m) => models.get(m).has(c)),
         }));
         const seeAlso = relatedFamilies(fam, familyNames);
@@ -452,8 +440,7 @@ async function build(previous, sourceStamp) {
       writeJson(`${OUT}/years/${year}/${makeSlug}.json`, {
         year,
         make,
-        models: modelList,       // old format — keep until the app is updated
-        families: familyList,    // NEW format
+        families: familyList,   // the old "models" list is gone
       });
 
       makeList.push({
@@ -461,7 +448,7 @@ async function build(previous, sourceStamp) {
         slug: makeSlug,
         recallCount: makeCampaigns.size,
         modelCount: models.size,
-        familyCount: familyList.length,   // NEW
+        familyCount: familyList.length,
       });
     }
 
