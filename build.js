@@ -1,6 +1,7 @@
 // build.js — turns NHTSA's giant recall file into tidy files for the app
 // LESSON 14 VERSION (B): last 20 model years, PLUS urgent recalls for older vehicles
 // LESSON 17: adds NHTSA crash-test ratings (2011+), attached to families that match by name
+// LESSON 18: adds NHTSA's open defect investigations, attached to families that match by name
 
 const fs = require('fs');
 const path = require('path');
@@ -16,12 +17,29 @@ const OUT = 'output';
 // Our own published "front page" — the robot's memory of last time
 const PUBLISHED_META_URL = 'https://stubenvolld.github.io/recall-data/meta.json';
 
-// NEW (Lesson 17): NHTSA's 5-Star crash-test ratings
+// NHTSA's 5-Star crash-test ratings (Lesson 17)
 const RATINGS_URL = 'https://static.nhtsa.gov/nhtsa/downloads/Safercar/Safercar_data.csv';
 const RATINGS_FIRST_YEAR = 2011;   // NHTSA's current crash tests began with 2011 models
 const MIN_RATING_ROWS = 5000;      // fewer than this means the download is probably broken
 // A "known answer": if we read this car wrong, our column reading is broken
 const RATING_REFEREE = { year: 2024, make: 'LEXUS', model: 'NX 350H', front: 4, side: 5 };
+
+// NEW (Lesson 18): NHTSA's defect investigations
+const INV_URL = 'https://static.nhtsa.gov/odi/ffdd/inv/FLAT_INV.zip';
+const INV_ZIP = 'raw/FLAT_INV.zip';
+const INV_FILE = 'raw/FLAT_INV.txt';
+// Only the stages an owner cares about: DP petition, PE first look,
+// EA engineering analysis, RQ checking whether a recall fix works
+const INV_STAGES = ['DP', 'PE', 'EA', 'RQ'];
+const INV_MAX_AGE_YEARS = 10;      // older "open" records are leftovers nobody closed
+const MIN_INVESTIGATIONS = 3000;   // the whole file had 5,355 when we explored it
+// A "known answer" from a CLOSED investigation, so it never changes
+const INV_REFEREE = { action: 'DP22005', make: 'LEXUS', model: 'RX HYBRID', year: 2019, opened: '20230127' };
+// Column numbers from INV.txt (JavaScript counts from 0, so subtract 1)
+const INV_COL = {
+  action: 0, make: 1, model: 2, year: 3, component: 4,
+  opened: 6, closed: 7, campaign: 8, subject: 9, summary: 10,
+};
 
 // MODEL-YEAR WINDOW — the app shows all recalls for recent model years.
 // Older vehicles appear ONLY if they have an urgent recall (Do Not Drive / Park Outside).
@@ -65,7 +83,7 @@ function slug(text) {
   return text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
 }
 
-// ---------- CSV READING AND RATING MATCHING (NEW in Lesson 17) ----------
+// ---------- CSV READING AND RATING MATCHING (Lesson 17) ----------
 // Reads the WHOLE file one letter at a time, so commas and Enter keys
 // inside "quotes" stay part of the value.
 function parseCsv(text) {
@@ -210,7 +228,7 @@ async function getPublishedMeta() {
   }
 }
 
-// CHANGED (Lesson 17): works for any file, so we can stamp both recalls and ratings
+// Works for any file, so we can stamp recalls, ratings and investigations
 async function getStamp(url) {
   try {
     const response = await fetch(url, { method: 'HEAD' });
@@ -317,7 +335,7 @@ async function refereeCheck(vehicles) {
   console.log(`Referee passed: missing ${missingTotal} of ${liveTotal} live recalls (limit ${MAX_REFEREE_MISSING * 100}%).\n`);
 }
 
-// ---------- CRASH-TEST RATINGS (NEW in Lesson 17) ----------
+// ---------- CRASH-TEST RATINGS (Lesson 17) ----------
 // Recalls are the safety-critical part, so a ratings problem never blocks them:
 // if anything here looks wrong, we skip ratings for this run and keep going.
 async function loadRatings() {
@@ -387,19 +405,111 @@ async function loadRatings() {
   }
 }
 
+// ---------- OPEN INVESTIGATIONS (NEW in Lesson 18) ----------
+// Same promise as ratings: a problem here never blocks recalls.
+async function loadInvestigations() {
+  console.log('Loading NHTSA investigations…');
+  try {
+    const response = await fetch(INV_URL);
+    if (!response.ok) throw new Error(`NHTSA answered with code ${response.status}`);
+    fs.writeFileSync(INV_ZIP, Buffer.from(await response.arrayBuffer()));
+    new AdmZip(INV_ZIP).extractAllTo('raw', true);
+    if (!fs.existsSync(INV_FILE)) throw new Error(`${INV_FILE} was not inside the zip`);
+
+    // e.g. "20160101": anything opened before this is treated as an old leftover
+    const oldestOpened = `${new Date().getFullYear() - INV_MAX_AGE_YEARS}0101`;
+    const ref = INV_REFEREE;
+
+    const allActions = new Set();   // every investigation in the file (for the safety check)
+    const details = new Map();      // action number -> details (kept ones only)
+    const byCar = new Map();        // "year|make|model" -> action numbers
+    const carsFor = new Map();      // action number -> every car it covers
+    let refereeSeen = false;
+
+    // 373 MB, so we read it line by line like the recall file
+    const reader = readline.createInterface({
+      input: fs.createReadStream(INV_FILE),
+      crlfDelay: Infinity,
+    });
+
+    for await (const line of reader) {
+      const cols = line.split('\t');
+      const action = (cols[INV_COL.action] || '').trim();
+      if (!action) continue;
+      allActions.add(action);
+
+      const make = canonicalMake(clean(cols[INV_COL.make]));
+      const model = clean(cols[INV_COL.model]);
+      const year = Number(cols[INV_COL.year]);
+      const opened = (cols[INV_COL.opened] || '').trim();
+      const closed = (cols[INV_COL.closed] || '').trim();
+
+      // The control test: a closed investigation whose open date we already know
+      if (action === ref.action && make === ref.make && model === ref.model && year === ref.year) {
+        if (opened !== ref.opened) {
+          throw new Error(`known-answer check failed: ${ref.action} shows opened ${opened}, expected ${ref.opened}`);
+        }
+        refereeSeen = true;
+      }
+
+      // Our rule: owner stage, still open, opened in the last 10 years, a real vehicle
+      const stage = action.slice(0, 2);
+      if (!INV_STAGES.includes(stage)) continue;
+      if (closed) continue;
+      if (!opened || opened < oldestOpened) continue;
+      if (!make || !model || !(year >= 1949 && year <= NEWEST_YEAR)) continue;
+
+      if (!details.has(action)) {
+        details.set(action, {
+          action,
+          stage,
+          opened,
+          subject: (cols[INV_COL.subject] || '').trim(),
+          component: (cols[INV_COL.component] || '').trim(),
+          summary: (cols[INV_COL.summary] || '').trim(),
+          recalls: new Set(),
+        });
+      }
+      const campaign = (cols[INV_COL.campaign] || '').trim();
+      if (campaign) details.get(action).recalls.add(campaign);
+
+      const key = `${year}|${make}|${model}`;
+      if (!byCar.has(key)) byCar.set(key, new Set());
+      byCar.get(key).add(action);
+      if (!carsFor.has(action)) carsFor.set(action, new Set());
+      carsFor.get(action).add(key);
+    }
+
+    if (allActions.size < MIN_INVESTIGATIONS) {
+      throw new Error(`only ${allActions.size} investigations in the file (minimum ${MIN_INVESTIGATIONS})`);
+    }
+    if (!refereeSeen) {
+      throw new Error(`known-answer check failed: ${ref.action} for the ${ref.year} ${ref.make} ${ref.model} was not found`);
+    }
+
+    console.log(`  ✓ ${allActions.size.toLocaleString()} investigations in the file`);
+    console.log(`  ✓ Known-answer check: ${ref.action} opened ${ref.opened}`);
+    console.log(`  ✓ Kept ${details.size} open investigations (DP, PE, EA, RQ, opened since ${oldestOpened.slice(0, 4)})\n`);
+    return { details, byCar, carsFor };
+  } catch (err) {
+    console.log(`  ⚠ Investigations skipped this run: ${err.message}. Recalls will still publish.\n`);
+    return null;
+  }
+}
+
 // ---------- BUILD ----------
 async function build(previous, sourceStamp) {
   const recalls = new Map();          // recall number -> details
   const vehicles = new Map();         // year -> make -> model -> recall numbers
   const recallVehicles = new Map();   // recall number -> every car it affects
   const fileCampaigns = new Set();    // every recall in NHTSA's file (for safety checks)
-  const urgentCampaigns = new Set();  // NEW: recalls with Do Not Drive / Park Outside on ANY row
-  const olderRows = [];               // NEW: the "maybe" pile — rows older than the window
+  const urgentCampaigns = new Set();  // recalls with Do Not Drive / Park Outside on ANY row
+  const olderRows = [];               // the "maybe" pile — rows older than the window
 
   let vehicleRows = 0;
   let skippedRows = 0;
 
-  // NEW: one place that adds a row to the three tables (used for normal rows AND kept older rows)
+  // One place that adds a row to the three tables (used for normal rows AND kept older rows)
   function addRow(cols, campaign, make, model, year) {
     if (!recalls.has(campaign)) {
       recalls.set(campaign, {
@@ -464,7 +574,7 @@ async function build(previous, sourceStamp) {
     addRow(cols, campaign, make, model, year);
   }
 
-  // NEW: from the "maybe" pile, keep only rows whose recall is urgent
+  // From the "maybe" pile, keep only rows whose recall is urgent
   let olderKept = 0;
   for (const r of olderRows) {
     if (urgentCampaigns.has(r.campaign)) {
@@ -481,9 +591,12 @@ async function build(previous, sourceStamp) {
 
   sanityCheck({ fileRecallCount: fileCampaigns.size, vehicleRows, skippedRows }, previous);
   await refereeCheck(vehicles);
-  const ratings = await loadRatings();          // NEW: null if ratings were skipped
-  const ratedNamesMatched = new Set();          // NEW: for the report
+  const ratings = await loadRatings();          // null if ratings were skipped
+  const ratedNamesMatched = new Set();          // for the report
   let familiesWithRatings = 0;
+  const invs = await loadInvestigations();      // NEW: null if investigations were skipped
+  const invsShown = new Set();                  // NEW: for the report
+  let familiesWithInvs = 0;
 
   // ---------- WRITE ----------
   fs.rmSync(OUT, { recursive: true, force: true });
@@ -498,8 +611,10 @@ async function build(previous, sourceStamp) {
     recallCount: recalls.size,
     oldestYear: OLDEST_YEAR,
     urgentOnlyBefore: OLDEST_YEAR,   // years below this show urgent recalls only
-    ratingsFrom: RATINGS_FIRST_YEAR, // NEW: years below this show the "2011 and newer" note
+    ratingsFrom: RATINGS_FIRST_YEAR, // years below this show the "2011 and newer" note
     ratingsAvailable: ratings !== null,
+    investigationsAvailable: invs !== null,   // NEW
+    investigationsMaxAgeYears: INV_MAX_AGE_YEARS,   // NEW
     vehicleRows,
     years,
   });
@@ -538,7 +653,7 @@ async function build(previous, sourceStamp) {
 
       const familyNames = [...familyMap.keys()].sort();
 
-      // NEW: attach crash-test ratings that match one of these families by name
+      // Attach crash-test ratings that match one of these families by name
       const familyRatings = new Map();
       const rated = (ratings && ratings.byYearMake.get(`${year}|${slug(make)}`)) || [];
       if (rated.length > 0) {
@@ -551,6 +666,7 @@ async function build(previous, sourceStamp) {
           ratedNamesMatched.add(`${year}|${make}|${r.model}`);
         }
       }
+
       const familyList = familyNames.map((fam) => {
         const { members, campaigns } = familyMap.get(fam);
         const memberList = [...members].sort();
@@ -561,16 +677,37 @@ async function build(previous, sourceStamp) {
         const seeAlso = relatedFamilies(fam, familyNames);
         if (seeAlso.length > 0) totalSeeAlso += 1;
         if (familyRatings.has(fam)) familiesWithRatings += 1;
+
+        // NEW: open investigations filed under the exact same model names as this family's members
+        const famInvs = new Map();   // action number -> member names it was filed for
+        if (invs) {
+          for (const m of memberList) {
+            for (const a of invs.byCar.get(`${year}|${make}|${m}`) || []) {
+              if (!famInvs.has(a)) famInvs.set(a, new Set());
+              famInvs.get(a).add(m);
+            }
+          }
+        }
+        if (famInvs.size > 0) familiesWithInvs += 1;
+        const invList = [...famInvs]
+          .map(([a, filedAs]) => {
+            const d = invs.details.get(a);
+            invsShown.add(a);
+            return { action: a, stage: d.stage, subject: d.subject, opened: d.opened, filedAs: [...filedAs].sort() };
+          })
+          .sort((x, y) => y.opened.localeCompare(x.opened));   // newest first
+
         return {
           family: fam,
           members: memberList,
           recallCount: campaigns.size,
           warningCount: recallList.filter((r) => r.doNotDrive || r.parkOutside).length,
           seeAlso,
-          // NEW: one entry per rated version and drive; empty if none matched
+          // One entry per rated version and drive; empty if none matched
           ratings: (familyRatings.get(fam) || []).sort(
             (a, b) => a.model.localeCompare(b.model) || (a.drive || '').localeCompare(b.drive || '')
           ),
+          investigations: invList,   // NEW: open investigations, newest first
           recalls: recallList,
         };
       });
@@ -606,6 +743,22 @@ async function build(previous, sourceStamp) {
     });
   }
 
+  // NEW: one file per open investigation, with the full summary and every car it covers
+  if (invs) {
+    for (const [action, d] of invs.details) {
+      const cars = [...invs.carsFor.get(action)].sort().map((v) => {
+        const [year, make, model] = v.split('|');
+        return { year: Number(year), make, model };
+      });
+      writeJson(`${OUT}/investigations/${action}.json`, {
+        ...d,
+        recalls: [...d.recalls],
+        vehicleCount: cars.length,
+        vehicles: cars,
+      });
+    }
+  }
+
   // ---------- REPORT ----------
   const all = [...recalls.values()];
   const dndOnly = all.filter((r) => r.doNotDrive && !r.parkOutside);
@@ -630,6 +783,12 @@ async function build(previous, sourceStamp) {
   } else {
     console.log('Crash ratings:       skipped this run');
   }
+  if (invs) {
+    console.log(`Open investigations: ${invsShown.size} of ${invs.details.size} shown on at least one family`);
+    console.log(`Families w/ invest.: ${familiesWithInvs.toLocaleString()}`);
+  } else {
+    console.log('Investigations:      skipped this run');
+  }
   console.log(`Files written:       ${fileCount.toLocaleString()}`);
   console.log(`Total size:          ${(totalBytes / 1024 / 1024).toFixed(1)} MB`);
 }
@@ -637,10 +796,13 @@ async function build(previous, sourceStamp) {
 // ---------- RUN EVERYTHING, IN ORDER ----------
 async function main() {
   const previous = await getPublishedMeta();
-  // CHANGED (Lesson 17): rebuild if EITHER file changed
+  // CHANGED (Lesson 18): rebuild if ANY of the three files changed
   const recallStamp = await getStamp(ZIP_URL);
   const ratingsStamp = await getStamp(RATINGS_URL);
-  const sourceStamp = recallStamp && ratingsStamp ? `${recallStamp} + ${ratingsStamp}` : null;
+  const invStamp = await getStamp(INV_URL);
+  const sourceStamp = recallStamp && ratingsStamp && invStamp
+    ? `${recallStamp} + ${ratingsStamp} + ${invStamp}`
+    : null;
   const forced = process.env.FORCE_BUILD === 'true';
 
   console.log(`NHTSA file stamp now:     ${sourceStamp || 'unknown'}`);
@@ -648,7 +810,7 @@ async function main() {
   console.log(`Forced rebuild:           ${forced ? 'yes' : 'no'}\n`);
 
   if (!forced && sourceStamp && previous && previous.sourceStamp === sourceStamp) {
-    console.log('NHTSA file unchanged since last publish. Skipping build; current files stay live.');
+    console.log('NHTSA files unchanged since last publish. Skipping build; current files stay live.');
     reportChanged(false);
     console.log('\nNOTHING TO DO');
     return;
