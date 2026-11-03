@@ -1,5 +1,6 @@
 // build.js — turns NHTSA's giant recall file into tidy files for the app
 // LESSON 14 VERSION (B): last 20 model years, PLUS urgent recalls for older vehicles
+// LESSON 17: adds NHTSA crash-test ratings (2011+), attached to families that match by name
 
 const fs = require('fs');
 const path = require('path');
@@ -14,6 +15,13 @@ const OUT = 'output';
 
 // Our own published "front page" — the robot's memory of last time
 const PUBLISHED_META_URL = 'https://stubenvolld.github.io/recall-data/meta.json';
+
+// NEW (Lesson 17): NHTSA's 5-Star crash-test ratings
+const RATINGS_URL = 'https://static.nhtsa.gov/nhtsa/downloads/Safercar/Safercar_data.csv';
+const RATINGS_FIRST_YEAR = 2011;   // NHTSA's current crash tests began with 2011 models
+const MIN_RATING_ROWS = 5000;      // fewer than this means the download is probably broken
+// A "known answer": if we read this car wrong, our column reading is broken
+const RATING_REFEREE = { year: 2024, make: 'LEXUS', model: 'NX 350H', front: 4, side: 5 };
 
 // MODEL-YEAR WINDOW — the app shows all recalls for recent model years.
 // Older vehicles appear ONLY if they have an urgent recall (Do Not Drive / Park Outside).
@@ -55,6 +63,59 @@ function isYes(text) {
 
 function slug(text) {
   return text.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-|-$/g, '');
+}
+
+// ---------- CSV READING AND RATING MATCHING (NEW in Lesson 17) ----------
+// Reads the WHOLE file one letter at a time, so commas and Enter keys
+// inside "quotes" stay part of the value.
+function parseCsv(text) {
+  const rows = [];
+  let row = [];
+  let current = '';
+  let insideQuotes = false;
+  for (let i = 0; i < text.length; i++) {
+    const ch = text[i];
+    if (insideQuotes) {
+      if (ch === '"') {
+        if (text[i + 1] === '"') { current += '"'; i++; }
+        else insideQuotes = false;
+      } else current += ch;
+    } else if (ch === '"') insideQuotes = true;
+    else if (ch === ',') { row.push(current); current = ''; }
+    else if (ch === '\n') { row.push(current); rows.push(row); row = []; current = ''; }
+    else if (ch !== '\r') current += ch;
+  }
+  if (current !== '' || row.length > 0) { row.push(current); rows.push(row); }
+  return rows.filter((r) => !(r.length === 1 && r[0].trim() === ''));
+}
+
+// Spaces and hyphens don't count when comparing names (NX 250 = NX250, S-CLASS = S CLASS)
+function squashName(name) {
+  return name.replace(/[\s-]+/g, '');
+}
+
+// Rule A: same as one of the family's members, ignoring spaces and hyphens
+// Rule B: the LONGEST family name the rating name starts with (GRAND CHEROKEE L -> GRAND CHEROKEE L)
+// No match -> null. We show no rating rather than guess.
+function matchFamily(ratingModel, families) {
+  const target = squashName(ratingModel);
+  for (const f of families) {
+    if (f.members.some((m) => squashName(m) === target)) return f.family;
+  }
+  let best = null;
+  for (const f of families) {
+    const name = f.family;
+    if (ratingModel === name || ratingModel.startsWith(name + ' ')) {
+      if (!best || name.length > best.length) best = name;
+    }
+  }
+  return best;
+}
+
+// A star rating is a whole number from 1 to 5. Anything else (blank, "Not Rated") -> null.
+function stars(text) {
+  const n = Number((text || '').trim());
+  return Number.isInteger(n) && n >= 1 && n <= 5 ? n : null;
 }
 
 // ---------- ONE NAME PER MAKE ----------
@@ -149,9 +210,10 @@ async function getPublishedMeta() {
   }
 }
 
-async function getSourceStamp() {
+// CHANGED (Lesson 17): works for any file, so we can stamp both recalls and ratings
+async function getStamp(url) {
   try {
-    const response = await fetch(ZIP_URL, { method: 'HEAD' });
+    const response = await fetch(url, { method: 'HEAD' });
     if (!response.ok) return null;
     return response.headers.get('etag') || response.headers.get('last-modified') || null;
   } catch (err) {
@@ -255,6 +317,76 @@ async function refereeCheck(vehicles) {
   console.log(`Referee passed: missing ${missingTotal} of ${liveTotal} live recalls (limit ${MAX_REFEREE_MISSING * 100}%).\n`);
 }
 
+// ---------- CRASH-TEST RATINGS (NEW in Lesson 17) ----------
+// Recalls are the safety-critical part, so a ratings problem never blocks them:
+// if anything here looks wrong, we skip ratings for this run and keep going.
+async function loadRatings() {
+  console.log('Loading crash-test ratings…');
+  try {
+    const response = await fetch(RATINGS_URL);
+    if (!response.ok) throw new Error(`NHTSA answered with code ${response.status}`);
+    const all = parseCsv(await response.text());
+
+    const header = all[0].map((h) => h.trim());
+    const col = (name) => {
+      const i = header.indexOf(name);
+      if (i === -1) throw new Error(`column ${name} is missing`);
+      return i;
+    };
+    const C = {
+      make: col('MAKE'), model: col('MODEL'), year: col('MODEL_YR'), drive: col('DRIVE_TRAIN'),
+      overall: col('OVERALL_STARS'), front: col('OVERALL_FRNT_STARS'),
+      side: col('OVERALL_SIDE_STARS'), rollover: col('ROLLOVER_STARS'),
+    };
+
+    const byYearMake = new Map();   // "2024|lexus" -> list of rated versions
+    const names = new Set();
+    let rows = 0;
+    let badRows = 0;
+    for (const v of all.slice(1)) {
+      if (v.length !== header.length) { badRows += 1; continue; }
+      const year = Number(v[C.year].trim());
+      if (!(year >= RATINGS_FIRST_YEAR && year <= NEWEST_YEAR)) continue;
+      const make = clean(v[C.make]);
+      const model = clean(v[C.model]);
+      if (!make || !model) continue;
+      rows += 1;
+      names.add(`${year}|${slug(make)}|${model}`);
+      const key = `${year}|${slug(make)}`;
+      if (!byYearMake.has(key)) byYearMake.set(key, []);
+      byYearMake.get(key).push({
+        model,
+        drive: clean(v[C.drive]) || null,
+        overall: stars(v[C.overall]),
+        front: stars(v[C.front]),
+        side: stars(v[C.side]),
+        rollover: stars(v[C.rollover]),
+      });
+    }
+
+    if (rows < MIN_RATING_ROWS) {
+      throw new Error(`only ${rows} rated rows for ${RATINGS_FIRST_YEAR}+ (minimum ${MIN_RATING_ROWS})`);
+    }
+    if (badRows / (all.length - 1) > MAX_SKIPPED_SHARE) {
+      throw new Error(`${badRows} rows had the wrong number of columns`);
+    }
+
+    // The control test: read a car whose answer we already know
+    const ref = RATING_REFEREE;
+    const refRow = (byYearMake.get(`${ref.year}|${slug(ref.make)}`) || []).find((r) => r.model === ref.model);
+    if (!refRow || refRow.front !== ref.front || refRow.side !== ref.side) {
+      throw new Error(`known-answer check failed for ${ref.year} ${ref.make} ${ref.model}`);
+    }
+
+    console.log(`  ✓ ${rows.toLocaleString()} rated rows for ${RATINGS_FIRST_YEAR}+, ${badRows} bad rows`);
+    console.log(`  ✓ Known-answer check: ${ref.year} ${ref.make} ${ref.model} front ${refRow.front}★, side ${refRow.side}★\n`);
+    return { byYearMake, nameCount: names.size };
+  } catch (err) {
+    console.log(`  ⚠ Ratings skipped this run: ${err.message}. Recalls will still publish.\n`);
+    return null;
+  }
+}
+
 // ---------- BUILD ----------
 async function build(previous, sourceStamp) {
   const recalls = new Map();          // recall number -> details
@@ -349,6 +481,9 @@ async function build(previous, sourceStamp) {
 
   sanityCheck({ fileRecallCount: fileCampaigns.size, vehicleRows, skippedRows }, previous);
   await refereeCheck(vehicles);
+  const ratings = await loadRatings();          // NEW: null if ratings were skipped
+  const ratedNamesMatched = new Set();          // NEW: for the report
+  let familiesWithRatings = 0;
 
   // ---------- WRITE ----------
   fs.rmSync(OUT, { recursive: true, force: true });
@@ -362,7 +497,9 @@ async function build(previous, sourceStamp) {
     fileRecallCount: fileCampaigns.size,
     recallCount: recalls.size,
     oldestYear: OLDEST_YEAR,
-    urgentOnlyBefore: OLDEST_YEAR,   // NEW: years below this show urgent recalls only
+    urgentOnlyBefore: OLDEST_YEAR,   // years below this show urgent recalls only
+    ratingsFrom: RATINGS_FIRST_YEAR, // NEW: years below this show the "2011 and newer" note
+    ratingsAvailable: ratings !== null,
     vehicleRows,
     years,
   });
@@ -400,6 +537,20 @@ async function build(previous, sourceStamp) {
       }
 
       const familyNames = [...familyMap.keys()].sort();
+
+      // NEW: attach crash-test ratings that match one of these families by name
+      const familyRatings = new Map();
+      const rated = (ratings && ratings.byYearMake.get(`${year}|${slug(make)}`)) || [];
+      if (rated.length > 0) {
+        const famObjs = familyNames.map((f) => ({ family: f, members: [...familyMap.get(f).members] }));
+        for (const r of rated) {
+          const fam = matchFamily(r.model, famObjs);
+          if (!fam) continue;   // no match: show no rating rather than guess
+          if (!familyRatings.has(fam)) familyRatings.set(fam, []);
+          familyRatings.get(fam).push(r);
+          ratedNamesMatched.add(`${year}|${make}|${r.model}`);
+        }
+      }
       const familyList = familyNames.map((fam) => {
         const { members, campaigns } = familyMap.get(fam);
         const memberList = [...members].sort();
@@ -409,12 +560,17 @@ async function build(previous, sourceStamp) {
         }));
         const seeAlso = relatedFamilies(fam, familyNames);
         if (seeAlso.length > 0) totalSeeAlso += 1;
+        if (familyRatings.has(fam)) familiesWithRatings += 1;
         return {
           family: fam,
           members: memberList,
           recallCount: campaigns.size,
           warningCount: recallList.filter((r) => r.doNotDrive || r.parkOutside).length,
           seeAlso,
+          // NEW: one entry per rated version and drive; empty if none matched
+          ratings: (familyRatings.get(fam) || []).sort(
+            (a, b) => a.model.localeCompare(b.model) || (a.drive || '').localeCompare(b.drive || '')
+          ),
           recalls: recallList,
         };
       });
@@ -467,6 +623,13 @@ async function build(previous, sourceStamp) {
   console.log(`Both warnings:       ${both.length}`);
   console.log(`Families:            ${totalFamilies.toLocaleString()}`);
   console.log(`Families w/ See also: ${totalSeeAlso.toLocaleString()}`);
+  if (ratings) {
+    const share = ((ratedNamesMatched.size / ratings.nameCount) * 100).toFixed(1);
+    console.log(`Rated names matched: ${ratedNamesMatched.size.toLocaleString()} of ${ratings.nameCount.toLocaleString()} (${share}%)`);
+    console.log(`Families w/ ratings: ${familiesWithRatings.toLocaleString()}`);
+  } else {
+    console.log('Crash ratings:       skipped this run');
+  }
   console.log(`Files written:       ${fileCount.toLocaleString()}`);
   console.log(`Total size:          ${(totalBytes / 1024 / 1024).toFixed(1)} MB`);
 }
@@ -474,7 +637,10 @@ async function build(previous, sourceStamp) {
 // ---------- RUN EVERYTHING, IN ORDER ----------
 async function main() {
   const previous = await getPublishedMeta();
-  const sourceStamp = await getSourceStamp();
+  // CHANGED (Lesson 17): rebuild if EITHER file changed
+  const recallStamp = await getStamp(ZIP_URL);
+  const ratingsStamp = await getStamp(RATINGS_URL);
+  const sourceStamp = recallStamp && ratingsStamp ? `${recallStamp} + ${ratingsStamp}` : null;
   const forced = process.env.FORCE_BUILD === 'true';
 
   console.log(`NHTSA file stamp now:     ${sourceStamp || 'unknown'}`);
