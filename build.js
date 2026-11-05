@@ -2,6 +2,7 @@
 // LESSON 14 VERSION (B): last 20 model years, PLUS urgent recalls for older vehicles
 // LESSON 17: adds NHTSA crash-test ratings (2011+), attached to families that match by name
 // LESSON 18: adds NHTSA's open defect investigations, attached to families that match by name
+// LESSON 21: adds a search index (search.json) so the app can find a car by typing
 
 const fs = require('fs');
 const path = require('path');
@@ -631,6 +632,8 @@ async function build(previous, sourceStamp) {
 
   let totalFamilies = 0;
   let totalSeeAlso = 0;
+  // NEW (Lesson 21): the search index — every make + vehicle, and the years it appears in
+  const searchIndex = new Map();   // "lexus|NX" -> { make, slug, family, years }
 
   for (const year of years) {
     const makes = vehicles.get(year);
@@ -715,6 +718,13 @@ async function build(previous, sourceStamp) {
       totalFamilies += familyList.length;
 
       const makeSlug = slug(make);
+
+      // NEW (Lesson 21): add each family to the search index
+      for (const f of familyList) {
+        const key = `${makeSlug}|${f.family}`;
+        if (!searchIndex.has(key)) searchIndex.set(key, { make, slug: makeSlug, family: f.family, years: new Set() });
+        searchIndex.get(key).years.add(year);
+      }
       writeJson(`${OUT}/years/${year}/${makeSlug}.json`, { year, make, families: familyList });
 
       makeList.push({
@@ -743,7 +753,17 @@ async function build(previous, sourceStamp) {
     });
   }
 
-  // NEW: one file per open investigation, with the full summary and every car it covers
+  // NEW (Lesson 21): write the search index as one small file.
+  // Each entry is a short list instead of named fields, to keep the file small:
+  // [make, make-slug, vehicle, [years, newest first]]
+  const searchItems = [...searchIndex.values()]
+    .sort((a, b) => a.make.localeCompare(b.make) || a.family.localeCompare(b.family))
+    .map((e) => [e.make, e.slug, e.family, [...e.years].sort((a, b) => b - a)]);
+  const searchBytesBefore = totalBytes;
+  writeJson(`${OUT}/search.json`, { builtAt: new Date().toISOString(), count: searchItems.length, items: searchItems });
+  const searchBytes = totalBytes - searchBytesBefore;
+
+  // One file per open investigation, with the full summary and every car it covers
   if (invs) {
     for (const [action, d] of invs.details) {
       const cars = [...invs.carsFor.get(action)].sort().map((v) => {
@@ -789,6 +809,7 @@ async function build(previous, sourceStamp) {
   } else {
     console.log('Investigations:      skipped this run');
   }
+  console.log(`Search index:        ${searchItems.length.toLocaleString()} vehicles, ${(searchBytes / 1024).toFixed(0)} KB`);
   console.log(`Files written:       ${fileCount.toLocaleString()}`);
   console.log(`Total size:          ${(totalBytes / 1024 / 1024).toFixed(1)} MB`);
 }
