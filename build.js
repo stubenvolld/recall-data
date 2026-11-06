@@ -3,6 +3,7 @@
 // LESSON 17: adds NHTSA crash-test ratings (2011+), attached to families that match by name
 // LESSON 18: adds NHTSA's open defect investigations, attached to families that match by name
 // LESSON 21: adds a search index (search.json) so the app can find a car by typing
+// CLEANUP 3: each make keeps the spelling NHTSA uses MOST often (not whichever came first)
 
 const fs = require('fs');
 const path = require('path');
@@ -138,15 +139,51 @@ function stars(text) {
 }
 
 // ---------- ONE NAME PER MAKE ----------
-const makeNames = new Map();
-const mergedMakes = new Map();
+// CHANGED (Cleanup 3): "MERCEDES BENZ" and "MERCEDES-BENZ" are the same make (same slug).
+// Before, we kept whichever spelling showed up FIRST in the file, so the name could
+// flip if NHTSA reordered its rows. Now we COUNT every spelling first, then keep the
+// one NHTSA uses most. A tie goes to the alphabetically first, so it never flips.
+const makeNames = new Map();     // slug -> the spelling we keep
+const makeCounts = new Map();    // slug -> (spelling -> how many rows use it)
+const mergedMakes = new Map();   // a spelling we replaced -> the spelling we kept
+
+async function countMakeSpellings() {
+  console.log('Counting make spellings…');
+  const reader = readline.createInterface({
+    input: fs.createReadStream(RAW_FILE),
+    crlfDelay: Infinity,
+  });
+  for await (const line of reader) {
+    const cols = line.split('\t');
+    if (cols[COL.type] !== 'V') continue;
+    const make = clean(cols[COL.make]);
+    if (!make) continue;
+    const key = slug(make);
+    if (!makeCounts.has(key)) makeCounts.set(key, new Map());
+    const spellings = makeCounts.get(key);
+    spellings.set(make, (spellings.get(make) || 0) + 1);
+  }
+  for (const [key, spellings] of makeCounts) {
+    const winner = [...spellings].sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))[0][0];
+    makeNames.set(key, winner);
+  }
+  console.log(`  ✓ ${makeNames.size.toLocaleString()} makes counted\n`);
+}
+
 function canonicalMake(make) {
   if (!make) return make;
   const key = slug(make);
+  // A make that's only in the investigations file wasn't counted: keep it as it is
   if (!makeNames.has(key)) makeNames.set(key, make);
   const kept = makeNames.get(key);
   if (kept !== make) mergedMakes.set(make, kept);
   return kept;
+}
+
+// How many recall rows used a spelling ("?" for one only seen in investigations)
+function rowsFor(make) {
+  const n = makeCounts.get(slug(make))?.get(make);
+  return n ? `${n.toLocaleString()} row${n === 1 ? '' : 's'}` : '?';
 }
 
 // ---------- FAMILIES ----------
@@ -543,6 +580,9 @@ async function build(previous, sourceStamp) {
     recallVehicles.get(campaign).add(`${year}|${make}|${model}`);
   }
 
+  // NEW (Cleanup 3): one quick read just to count spellings, BEFORE the real read
+  await countMakeSpellings();
+
   const reader = readline.createInterface({
     input: fs.createReadStream(RAW_FILE),
     crlfDelay: Infinity,
@@ -584,12 +624,6 @@ async function build(previous, sourceStamp) {
     }
   }
 
-  if (mergedMakes.size > 0) {
-    console.log('Merged make spellings:');
-    for (const [from, to] of mergedMakes) console.log(`  "${from}" → "${to}"`);
-    console.log('');
-  }
-
   sanityCheck({ fileRecallCount: fileCampaigns.size, vehicleRows, skippedRows }, previous);
   await refereeCheck(vehicles);
   const ratings = await loadRatings();          // null if ratings were skipped
@@ -598,6 +632,16 @@ async function build(previous, sourceStamp) {
   const invs = await loadInvestigations();      // NEW: null if investigations were skipped
   const invsShown = new Set();                  // NEW: for the report
   let familiesWithInvs = 0;
+
+  // MOVED (Cleanup 3): printed AFTER investigations, so their spellings are listed too.
+  // Each line shows how many rows used each spelling, so you can see why it won.
+  if (mergedMakes.size > 0) {
+    console.log('Merged make spellings (kept the most-used one):');
+    for (const [from, to] of [...mergedMakes].sort((a, b) => a[1].localeCompare(b[1]))) {
+      console.log(`  "${from}" (${rowsFor(from)}) → "${to}" (${rowsFor(to)})`);
+    }
+    console.log('');
+  }
 
   // ---------- WRITE ----------
   fs.rmSync(OUT, { recursive: true, force: true });
